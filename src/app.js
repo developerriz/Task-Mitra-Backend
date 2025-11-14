@@ -6,6 +6,10 @@ const connectDB = require("./config/db");
 const contactRoutes = require("./routes/contactRoutes");
 
 const app = express();
+// trust the first proxy (Render/Heroku/Vercel etc.)
+// Place this after `const app = express();`
+app.set("trust proxy", 1);
+
 const PORT = process.env.PORT || 5000;
 
 // Connect DB
