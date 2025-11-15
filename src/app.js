@@ -25,20 +25,57 @@ function _norm(o) {
   return `https://${s}`;
 }
 
-const defaultLocal = "http://localhost:5173";
-const envOrigin = _norm(process.env.FRONTEND_URL);
-const allowed = new Set([defaultLocal, envOrigin].filter(Boolean));
+function normalizeOrigin(origin) {
+  if (!origin) return null;
+  const s = origin.trim();
+  if (!s) return null;
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+  return `https://${s}`;
+}
 
-app.use(cors({
+const defaultLocalOrigins = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "http://127.0.0.1:3000",
+];
+
+// support multiple origins via FRONTEND_URLS or a single FRONTEND_URL
+const rawEnv = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const normalizedEnv = rawEnv.map(normalizeOrigin).filter(Boolean);
+const allowedOrigins = Array.from(new Set([...defaultLocalOrigins, ...normalizedEnv]));
+
+console.log("Allowed CORS origins:", allowedOrigins);
+
+const corsOptions = {
   origin: function (incomingOrigin, callback) {
-    if (!incomingOrigin) return callback(null, true); // tools like curl/postman
-    if (allowed.has(incomingOrigin)) return callback(null, true);
+    // allow server-side (curl/postman) requests where origin is undefined
+    if (!incomingOrigin) {
+      console.log("CORS: no origin header (likely server or curl). Allowing.");
+      return callback(null, true);
+    }
+
+    console.log("CORS: incoming origin:", incomingOrigin);
+
+    if (allowedOrigins.includes(incomingOrigin)) {
+      // allow and let cors set Access-Control-Allow-Origin to incomingOrigin
+      return callback(null, true);
+    }
+
+    // explicit deny — return an error so no CORS header is set (browser will block)
+    console.warn("CORS: origin not allowed:", incomingOrigin);
     return callback(new Error("CORS policy: Origin not allowed"), false);
   },
   optionsSuccessStatus: 200,
-}));
+  credentials: false,
+};
 
-
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions)); // respond to preflight
 
 
 app.use(express.json({ limit: "10kb" }));
