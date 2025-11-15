@@ -8,15 +8,16 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
   );
 }
 
-const sendSms = async ({ to, body }) => {
+const sendWhatsAppMessage = async ({ to, body }) => {
   if (!client) {
-    throw new Error("Twilio client not configured. Check env variables.");
+    throw new Error("Twilio client not configured. Check env vars.");
   }
+
   return client.messages.create({
+    from: "whatsapp:+14155238886",           // Twilio WhatsApp sandbox number
+    to: `whatsapp:${to}`,                    // User number must include whatsapp:
     body,
-    from: process.env.TWILIO_FROM,
-    to,
   });
 };
 
-module.exports = sendSms;
+module.exports = sendWhatsAppMessage;

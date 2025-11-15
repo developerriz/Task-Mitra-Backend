@@ -17,6 +17,24 @@ const contactSchema = Joi.object({
 
 const sanitize = (s) => (typeof s === "string" ? s.replace(/\s+/g, " ").trim() : s);
 
+/**
+ * Helper to safely extract a SendGrid message id from the response returned by @sendgrid/mail.
+ * sendGridRes is usually an array; headers might be an AxiosHeaders instance or plain object.
+ */
+function getSendgridMessageId(sendGridRes) {
+  try {
+    if (!sendGridRes) return null;
+    const first = Array.isArray(sendGridRes) ? sendGridRes[0] : sendGridRes;
+    if (!first) return null;
+    const headers = first.headers;
+    if (!headers) return null;
+    // AxiosHeaders may behave like a map; try both access patterns
+    return headers['x-message-id'] || (typeof headers.get === 'function' && headers.get('x-message-id')) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 exports.submitLead = async (req, res) => {
   try {
     const { error, value } = contactSchema.validate(req.body);
@@ -44,56 +62,124 @@ exports.submitLead = async (req, res) => {
     // Build email subject (HTML will be built inside sendEmail using leadData)
     const emailSubject = `New Lead: ${lead.service} - ${lead.name}`;
 
-    // Start notifications but do NOT await them (non-blocking)
+    // Start notifications
     const tasks = [];
+    const notificationMeta = []; // keep track of which task is which (sms/email)
 
     if (process.env.CONTACT_PHONE) {
+      notificationMeta.push({ channel: "sms", dest: process.env.CONTACT_PHONE });
       tasks.push(
         (async () => {
           try {
             return await sendSms({ to: process.env.CONTACT_PHONE, body: smsText });
           } catch (err) {
-            throw new Error(`SMS error: ${err.message || err}`);
+            // keep error informative but not huge
+            throw new Error(err?.message || String(err));
           }
         })()
       );
     }
 
     if (process.env.EMAIL_TO) {
+      notificationMeta.push({ channel: "email", dest: process.env.EMAIL_TO });
       tasks.push(
         (async () => {
           try {
-            // pass lead (Mongoose doc or plain object) as leadData so sendEmail will generate the HTML template
             return await sendEmail({
               to: process.env.EMAIL_TO,
               subject: emailSubject,
-              // text fallback will be auto-generated inside sendEmail if not provided
               leadData: lead,
-              // optional: add options for CTA or colors:
-              // options: { viewUrl: `${process.env.BASE_URL}/admin/leads/${lead._id}` }
             });
           } catch (err) {
-            throw new Error(`Email error: ${err.message || err}`);
+            throw new Error(err?.response?.body?.errors?.map(e => e.message).join(", ") || err?.message || String(err));
           }
         })()
       );
     }
 
-    // Fire-and-forget, but log results when they finish
-    Promise.allSettled(tasks).then((results) => {
-      results.forEach((r, i) => {
-        if (r.status === "rejected") {
-          console.error(`Notification ${i} failed for lead ${lead._id}:`, r.reason);
-        } else {
-          console.info(`Notification ${i} succeeded for lead ${lead._id}:`, r.value?.sid || r.value?.messageId || "ok");
-        }
-      });
-    }).catch((e) => {
-      console.error("Notification handling unexpected error:", e);
-    });
+    // Fire-and-forget response to client
+    res.status(201).json({ message: "Lead submitted successfully", leadId: lead._id });
 
-    // Respond immediately
-    return res.status(201).json({ message: "Lead submitted successfully", leadId: lead._id });
+    // When tasks finish, persist results to the lead document so you can trace delivery later
+    Promise.allSettled(tasks)
+      .then(async (results) => {
+        try {
+          const notifications = {}; // { sms: {...}, email: {...} }
+
+          for (let i = 0; i < results.length; i++) {
+            const meta = notificationMeta[i] || { channel: `notification_${i}`, dest: null };
+            const r = results[i];
+
+            if (meta.channel === "sms") {
+              if (r.status === "fulfilled") {
+                // Twilio returns an object with .sid
+                notifications.sms = {
+                  sent: true,
+                  sid: r.value?.sid || null,
+                  status: r.value?.status || "unknown",
+                  to: meta.dest,
+                  error: null,
+                };
+                console.info(`SMS succeeded for lead ${lead._id}:`, notifications.sms.sid);
+              } else {
+                notifications.sms = {
+                  sent: false,
+                  sid: null,
+                  status: "failed",
+                  to: meta.dest,
+                  error: String(r.reason?.message || r.reason || "unknown error").slice(0, 1000),
+                };
+                console.error(`SMS failed for lead ${lead._id}:`, notifications.sms.error);
+              }
+            } else if (meta.channel === "email") {
+              if (r.status === "fulfilled") {
+                const sgMessageId = getSendgridMessageId(r.value);
+                notifications.email = {
+                  sent: true,
+                  sendgridMessageId: sgMessageId,
+                  rawResponse: !!r.value, // boolean to indicate response presence
+                  to: meta.dest,
+                  error: null,
+                };
+                console.info(`Email accepted by SendGrid for lead ${lead._id}:`, sgMessageId);
+              } else {
+                notifications.email = {
+                  sent: false,
+                  sendgridMessageId: null,
+                  rawResponse: false,
+                  to: meta.dest,
+                  error: String(r.reason?.message || r.reason || "unknown error").slice(0, 1000),
+                };
+                console.error(`Email failed for lead ${lead._id}:`, notifications.email.error);
+              }
+            } else {
+              // generic handling
+              notifications[meta.channel] = {
+                sent: r.status === "fulfilled",
+                result: r.status === "fulfilled" ? r.value : null,
+                error: r.status === "rejected" ? String(r.reason?.message || r.reason) : null,
+                to: meta.dest,
+              };
+            }
+          }
+
+          // Attach notifications + timestamp to lead and save
+          lead.notifications = {
+            ...lead.notifications, // preserve if anything existed
+            ...notifications,
+            lastUpdatedAt: new Date(),
+          };
+
+          await lead.save();
+          console.info(`Lead ${lead._id} updated with notification results.`);
+        } catch (e) {
+          console.error("Failed to save notification results for lead", lead._id, e);
+        }
+      })
+      .catch((e) => {
+        console.error("Notification handling unexpected error:", e);
+      });
+
   } catch (err) {
     console.error("submitLead error:", err);
     return res.status(500).json({ error: "Server error. Try again later." });
