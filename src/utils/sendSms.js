@@ -13,6 +13,7 @@ const sendWhatsAppMessage = async ({ to, body }) => {
     throw new Error("Twilio client not configured. Check env vars.");
   }
 
+  
   return client.messages.create({
     from: "whatsapp:+14155238886",           // Twilio WhatsApp sandbox number
     to: `whatsapp:${to}`,                    // User number must include whatsapp:
